@@ -31,5 +31,7 @@ def faulty_topic(small_fleet):
         invalid_value_rate=0.01,
     )
     topic = InMemoryTopic(4)
-    topic.extend(inject_faults(interleave(tracks, 20), cfg, stats, seed=3), timestamp_ms=1_800_000_000_000)
+    topic.extend(
+        inject_faults(interleave(tracks, 20), cfg, stats, seed=3), timestamp_ms=1_800_000_000_000
+    )
     return topic, stats

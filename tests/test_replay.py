@@ -1,0 +1,48 @@
+from collections import Counter
+
+from fleetscope.replay.fleet import FaultConfig, FaultStats, inject_faults, interleave
+from fleetscope.schema import decode_chunk
+
+
+def test_interleave_is_event_time_ordered(small_fleet):
+    tracks, _ = small_fleet
+    starts = [c.t_ns[0] for c in interleave(tracks[:5], 20)]
+    assert starts == sorted(starts)
+
+
+def test_no_faults_is_identity(small_fleet):
+    tracks, _ = small_fleet
+    stats = FaultStats()
+    out = list(inject_faults(interleave(tracks[:3], 20), FaultConfig(), stats))
+    assert len(out) == stats.chunks == stats.messages
+    assert sum(len(decode_chunk(e.value)) for e in out) == stats.samples
+
+
+def test_fault_accounting_matches_emitted_stream(faulty_topic):
+    topic, stats = faulty_topic
+    assert len(topic) == stats.messages == stats.chunks + stats.duplicates + stats.corrupt
+    keys = Counter()
+    decodable = 0
+    for part in topic.partitions:
+        for r in part:
+            try:
+                c = decode_chunk(r.value)
+            except Exception:
+                continue
+            decodable += 1
+            keys[(c.vehicle_id, c.trip_id, c.seq)] += 1
+    assert decodable == stats.chunks + stats.duplicates
+    assert sum(v - 1 for v in keys.values()) == stats.duplicates
+    assert stats.late > 0 and stats.reordered > 0 and stats.invalid_rows > 0
+
+
+def test_same_vehicle_always_maps_to_same_partition(faulty_topic):
+    topic, _ = faulty_topic
+    owner = {}
+    for p, part in enumerate(topic.partitions):
+        for r in part:
+            try:
+                v = decode_chunk(r.value).vehicle_id
+            except Exception:
+                continue
+            assert owner.setdefault(v, p) == p
