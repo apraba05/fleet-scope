@@ -160,7 +160,7 @@ def load_segment(seg_path: str | Path, vehicle_id: str | None = None, hz: int = 
     # Build the UTC grid in integer ns: (boot_s + offset) * 1e9 in float64 would only be
     # accurate to ~256 ns at epoch magnitudes and jitter the sample period.
     period_ns = 1_000_000_000 // hz
-    t_ns = int(round((start + offset) * 1e9)) + np.arange(len(grid), dtype=np.int64) * period_ns
+    t_ns = round((start + offset) * 1e9) + np.arange(len(grid), dtype=np.int64) * period_ns
 
     signals = {
         "speed": speed,

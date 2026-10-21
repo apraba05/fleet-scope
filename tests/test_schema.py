@@ -17,7 +17,7 @@ def test_chunking_covers_track_in_order():
     chunks = tr.chunks(20)
     assert [c.seq for c in chunks] == [0, 1, 2]
     assert [len(c) for c in chunks] == [20, 20, 5]
-    assert sum((c.t_ns for c in chunks), []) == tr.t_ns.tolist()
+    assert [t for c in chunks for t in c.t_ns] == tr.t_ns.tolist()
 
 
 def test_roundtrip_preserves_values_including_nan():

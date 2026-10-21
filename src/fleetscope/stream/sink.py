@@ -50,7 +50,10 @@ class PartitionSink:
     def flush(
         self, start_offset: int, end_offset: int, ingest_date: str
     ) -> list[tuple[Path, int, int]]:
-        """Write buffered tables as files covering offsets [start, end]. Returns (path, rows, bytes)."""
+        """Write buffered tables as files covering offsets [start, end].
+
+        Returns ``(path, rows, bytes)`` per file written.
+        """
         written: list[tuple[Path, int, int]] = []
         name = data_file_name(self.topic, self.partition, start_offset, end_offset)
         for table, parts in self._buffers.items():

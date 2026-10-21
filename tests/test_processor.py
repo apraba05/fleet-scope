@@ -43,7 +43,9 @@ def snapshot(lake: Path) -> dict[str, pa.Table | None]:
 
 
 def cfg(lake, rows=20_000, **kw):
-    return ProcessorConfig(lake_root=lake, durable=False, epoch_max_rows=rows, epoch_max_s=1e9, **kw)
+    return ProcessorConfig(
+        lake_root=lake, durable=False, epoch_max_rows=rows, epoch_max_s=1e9, **kw
+    )
 
 
 def test_counts_match_injected_faults_exactly(tmp_path, faulty_topic):

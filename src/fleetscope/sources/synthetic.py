@@ -69,6 +69,7 @@ class FleetConfig:
     hz: int = SAMPLE_HZ
     rates_per_hour: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_RATES_PER_HOUR))
     urban_fraction: float = 0.4
+    intensity: str = "clear"  # or "borderline", see INTENSITY
 
 
 @dataclass
@@ -107,9 +108,42 @@ def _ou(rng: np.random.Generator, n: int, theta: float, sigma: float, dt: float)
     return x
 
 
+# Parameter ranges per difficulty. "clear" events sit well beyond detector thresholds
+# (measures pipeline correctness); "borderline" ranges straddle the thresholds (measures
+# how detection degrades near the decision boundary).
+INTENSITY: dict[str, dict[str, tuple[float, float]]] = {
+    "clear": {
+        "hard_brake": (4.8, 8.0),  # peak decel, m/s^2
+        "harsh_accel": (3.6, 4.6),
+        "sharp_turn": (4.2, 6.0),  # peak |a_lat|
+        "evasive_swerve": (3.4, 5.0),
+        "cut_in_ttc": (0.8, 1.7),  # s
+        "tailgating": (0.3, 0.6),  # headway, s
+        "sensor_dropout": (0.7, 3.0),  # gap, s
+        "gnss_outage": (8.0, 30.0),  # s
+    },
+    "borderline": {
+        "hard_brake": (3.0, 6.0),
+        "harsh_accel": (2.4, 4.0),
+        "sharp_turn": (2.8, 5.0),
+        "evasive_swerve": (2.0, 4.0),
+        "cut_in_ttc": (1.2, 3.0),
+        "tailgating": (0.5, 1.1),
+        "sensor_dropout": (0.3, 1.5),
+        "gnss_outage": (2.0, 15.0),
+    },
+}
+
+
 def _schedule_events(
-    rng: np.random.Generator, n: int, hz: int, rates: dict[str, float], aggressiveness: float
+    rng: np.random.Generator,
+    n: int,
+    hz: int,
+    rates: dict[str, float],
+    aggressiveness: float,
+    intensity: str = "clear",
 ) -> list[_Event]:
+    ranges = INTENSITY[intensity]
     hours = n / hz / 3600
     durations_s = {
         "hard_brake": (1.0, 2.2),
@@ -118,8 +152,8 @@ def _schedule_events(
         "evasive_swerve": (1.6, 2.6),
         "cut_in": (3.0, 4.0),
         "tailgating": (6.0, 15.0),
-        "sensor_dropout": (0.7, 3.0),
-        "gnss_outage": (8.0, 30.0),
+        "sensor_dropout": ranges["sensor_dropout"],
+        "gnss_outage": ranges["gnss_outage"],
     }
     candidates: list[_Event] = []
     for kind, rate in rates.items():
@@ -127,7 +161,7 @@ def _schedule_events(
         k = rng.poisson(rate * scale * hours)
         for _ in range(k):
             lo, hi = durations_s[kind]
-            length = int(rng.uniform(lo, hi) * hz)
+            length = max(1, int(rng.uniform(lo, hi) * hz))
             start = int(rng.uniform(30 * hz, max(30 * hz + 1, n - length - 10 * hz)))
             candidates.append(_Event(kind, start, length, {}))
     # Keep events at least 10 s apart so labels are unambiguous.
@@ -139,23 +173,27 @@ def _schedule_events(
         if kept and ev.start < kept[-1].start + kept[-1].length + 10 * hz:
             continue
         kept.append(ev)
+
+    def side() -> float:
+        return float(rng.choice([-1.0, 1.0]))
+
     for ev in kept:
         if ev.kind == "hard_brake":
-            ev.params = {"peak": -rng.uniform(4.8, 8.0)}
+            ev.params = {"peak": -rng.uniform(*ranges["hard_brake"])}
         elif ev.kind == "harsh_accel":
-            ev.params = {"peak": rng.uniform(3.6, 4.6)}
+            ev.params = {"peak": rng.uniform(*ranges["harsh_accel"])}
         elif ev.kind == "sharp_turn":
-            ev.params = {"a_lat": rng.choice([-1, 1]) * rng.uniform(4.2, 6.0)}
+            ev.params = {"a_lat": side() * rng.uniform(*ranges["sharp_turn"])}
         elif ev.kind == "evasive_swerve":
-            ev.params = {"a_lat": rng.choice([-1, 1]) * rng.uniform(3.4, 5.0)}
+            ev.params = {"a_lat": side() * rng.uniform(*ranges["evasive_swerve"])}
         elif ev.kind == "cut_in":
             ev.params = {
-                "ttc0": rng.uniform(0.8, 1.7),
+                "ttc0": rng.uniform(*ranges["cut_in_ttc"]),
                 "closing0": rng.uniform(4.0, 8.0),
                 "brake": -rng.uniform(2.2, 3.2),
             }
         elif ev.kind == "tailgating":
-            ev.params = {"headway": rng.uniform(0.3, 0.6)}
+            ev.params = {"headway": rng.uniform(*ranges["tailgating"])}
     return kept
 
 
@@ -183,6 +221,7 @@ def generate_trip(
     rates: dict[str, float] | None = None,
     aggressiveness: float = 1.0,
     urban: bool = False,
+    intensity: str = "clear",
     origin: tuple[float, float] = (37.55, -122.2),
 ) -> tuple[Track, list[GroundTruthEvent]]:
     rates = DEFAULT_RATES_PER_HOUR if rates is None else rates
@@ -198,7 +237,7 @@ def generate_trip(
         target = _piecewise(rng, n, 40 * hz, lambda: rng.uniform(24, 32))
     target[: 5 * hz] = target[5 * hz]  # no stop right at departure
 
-    events = _schedule_events(rng, n, hz, rates, aggressiveness)
+    events = _schedule_events(rng, n, hz, rates, aggressiveness, intensity)
     lon_override = np.full(n, np.nan)
     lon_event = np.full(n, -1, dtype=np.int64)
     for idx, ev in enumerate(events):
@@ -283,44 +322,56 @@ def generate_trip(
     steering = np.degrees(np.arctan(WHEELBASE_M * yaw / v_safe)) * STEERING_RATIO
 
     # ---- radar lead -------------------------------------------------------------------
+    # The ego driver aims for a time headway h(t); the actual gap follows that target
+    # through a first-order lag (tau = 2 s), i.e. the relative speed is bounded and smooth,
+    # as it is between two real vehicles. Tailgating lowers the target headway; a cut-in
+    # replaces the gap directly with a new, much closer vehicle.
     present = _piecewise(rng, n, 45 * hz, lambda: rng.choice([1.0, 0.0], p=[0.75, 0.25])) > 0.5
     h_driver = rng.uniform(1.3, 2.4) / max(aggressiveness, 0.5) ** 0.3
-    headway = np.clip(h_driver + _ou(rng, n, theta=0.1, sigma=0.15, dt=dt), 1.0, 4.0)
-    gap = headway * speed + 2.0
+    # Smoothed OU: drivers drift in following distance over seconds, not per sample.
+    drift = _smooth(_ou(rng, n, theta=0.05, sigma=0.12, dt=dt), 5 * hz)
+    headway = np.clip(h_driver + drift, 1.0, 4.0)
+    standstill = np.full(n, 2.0)
+    forced = np.full(n, np.nan)  # gap override (cut-in profile)
     breaks = np.zeros(n, dtype=bool)
     for ev in events:
         sl = slice(ev.start, ev.start + ev.length)
         if ev.kind == "tailgating":
-            ev.accepted = bool(speed[sl].min() >= 12.0)
+            ev.accepted = bool(np.min(speed[sl]) >= 12.0)
             if ev.accepted:
-                ramp = 2 * hz
-                h = np.full(ev.length + 2 * ramp, ev.params["headway"])
-                h[:ramp] = np.linspace(headway[ev.start - ramp], ev.params["headway"], ramp)
-                h[-ramp:] = np.linspace(
-                    ev.params["headway"], headway[min(n - 1, ev.start + ev.length + ramp)], ramp
-                )
+                ramp = 4 * hz
                 a, b = ev.start - ramp, min(n, ev.start + ev.length + ramp)
-                gap[a:b] = h[: b - a] * speed[a:b] + 0.5
+                h = np.full(b - a, ev.params["headway"])
+                h[:ramp] = np.linspace(headway[a], ev.params["headway"], ramp)
+                tail = b - (ev.start + ev.length)
+                h[len(h) - tail :] = np.linspace(ev.params["headway"], headway[b - 1], tail)
+                headway[a:b] = h
+                standstill[a:b] = 0.5
                 present[a:b] = True
+                ev.start, ev.length = a, b - a  # label covers approach, hold and release
         elif ev.kind == "cut_in" and ev.accepted:
             closing0 = ev.params["closing0"]
             gap0 = ev.params["ttc0"] * closing0
-            L = ev.length
-            closing = closing0 * np.clip(1 - np.arange(L) / (0.8 * L), 0, 1)
-            cut_gap = gap0 - np.cumsum(closing) * dt
-            cut_gap = np.maximum(cut_gap, 2.0)
-            blend_len = min(8 * hz, n - (ev.start + L))
-            gap[sl] = cut_gap
-            if blend_len > 0:
-                tail = slice(ev.start + L, ev.start + L + blend_len)
-                w = np.linspace(0, 1, blend_len)
-                gap[tail] = (1 - w) * cut_gap[-1] + w * gap[tail]
-            present[ev.start : ev.start + L + max(blend_len, 0)] = True
+            # Closing speed decays as ego brakes; tau = ttc0 / 2 bottoms the gap at gap0 / 2,
+            # so the minimum TTC (= ttc0) occurs at the cut-in itself.
+            tau_c = ev.params["ttc0"] / 2
+            closing = closing0 * np.exp(-np.arange(ev.length) * dt / tau_c)
+            forced[sl] = gap0 - np.cumsum(closing) * dt
+            present[ev.start : min(n, ev.start + ev.length + 5 * hz)] = True
             breaks[ev.start] = True  # a different vehicle: new radar track
-    gap += _ou(rng, n, theta=2.0, sigma=0.1, dt=dt)
-    lead_dist = np.where(present, gap, np.nan)
-    lead_rel = _segment_gradient(lead_dist, breaks, dt)
-    lead_rel = np.where(np.isnan(lead_dist), np.nan, _smooth(np.nan_to_num(lead_rel), 3))
+    target = headway * speed + standstill
+    gap = np.empty(n)
+    g = float(target[0])
+    alpha = dt / 2.0
+    for i in range(n):
+        f = forced[i]
+        g = f if f == f else g + alpha * (target[i] - g)  # f == f: not NaN
+        gap[i] = g
+    # Radar measures range and Doppler range-rate independently: derive rel speed from the
+    # noise-free gap, then add small, independent measurement noise to each.
+    true_gap = np.where(present, gap, np.nan)
+    lead_rel = _segment_gradient(true_gap, breaks, dt) + rng.normal(0, 0.1, n)
+    lead_dist = true_gap + rng.normal(0, 0.1, n)
 
     # ---- position ---------------------------------------------------------------------
     heading = rng.uniform(0, 2 * np.pi) + np.cumsum(yaw) * dt
@@ -391,6 +442,7 @@ def generate_fleet(cfg: FleetConfig) -> tuple[list[Track], list[GroundTruthEvent
                 rates=cfg.rates_per_hour,
                 aggressiveness=aggressiveness,
                 urban=bool(rng.random() < cfg.urban_fraction),
+                intensity=cfg.intensity,
             )
             tracks.append(track)
             truth.extend(gt)

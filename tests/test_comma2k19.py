@@ -39,7 +39,7 @@ def test_boot_time_is_converted_to_utc_using_gnss_milliseconds(track):
 
 def test_signals_are_physically_plausible(track):
     s = track.signals
-    assert 7.5 < s["speed"].min() and s["speed"].max() < 21  # highway 280 traffic
+    assert s["speed"].min() > 7.5 and s["speed"].max() < 21  # highway 280 traffic
     assert np.abs(s["accel_long"]).max() < 4
     assert np.abs(s["accel_lat"]).max() < 2
     assert np.nanmean(s["lat"]) == pytest.approx(37.72, abs=0.02)
