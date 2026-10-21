@@ -43,6 +43,7 @@ class Lake:
     def __init__(self, root: str | Path, threads: int | None = None):
         self.root = Path(root)
         self.con = duckdb.connect()
+        self.con.execute("SET TimeZone = 'UTC'")  # results must not depend on the host
         if threads:
             self.con.execute(f"SET threads = {int(threads)}")
         self.refresh()

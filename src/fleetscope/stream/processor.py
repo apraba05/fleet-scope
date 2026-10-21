@@ -30,6 +30,7 @@ import pyarrow as pa
 from fleetscope import observability as obs
 from fleetscope.schema import (
     DLQ_SCHEMA,
+    OPTIONAL_SIGNALS,
     SIGNALS,
     WINDOW_SCHEMA,
     TelemetryChunk,
@@ -96,6 +97,17 @@ class DeadLetter:
     reason: str
     detail: str
     payload: bytes
+
+
+def _column(name: str, values: np.ndarray) -> pa.Array:
+    """Signal column for the lake. The wire format marks a missing optional signal (no GNSS
+    fix, no lead vehicle) with NaN; in the lake it is SQL NULL, so ``count(lead_dist)`` and
+    ``avg(lead_dist)`` mean what they say. A NaN in a required signal is a validation failure
+    and is kept as NaN in quarantine as evidence."""
+    v = values.astype(np.float32) if name in _F32 else values
+    if name in OPTIONAL_SIGNALS:
+        return pa.array(v, mask=np.isnan(v))
+    return pa.array(v)
 
 
 class PartitionProcessor:
@@ -251,7 +263,7 @@ class PartitionProcessor:
             "trip_id": pa.DictionaryArray.from_arrays(row_chunk, [c.trip_id for c in chunks]),
             "seq": np.repeat(np.fromiter((c.seq for c in chunks), np.int64, k), lengths),
             "ts": pa.array(t_ns, pa.timestamp("ns", tz="UTC")),
-            **{s: (cols[s].astype(np.float32) if s in _F32 else cols[s]) for s in SIGNALS},
+            **{s: _column(s, cols[s]) for s in SIGNALS},
             "source": pa.DictionaryArray.from_arrays(row_chunk, [c.source for c in chunks]),
             "kafka_partition": np.full(total, self.partition, dtype=np.int32),
             "kafka_offset": np.repeat(offsets, lengths),
