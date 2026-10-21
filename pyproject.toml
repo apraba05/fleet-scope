@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fleetscope"
+version = "0.1.0"
+description = "Autonomous vehicle fleet telemetry platform: Kafka ingestion, exactly-once Parquet lake, scenario mining and budgeted data selection."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Ashan Prapaharan" }]
+dependencies = [
+  "confluent-kafka>=2.5",
+  "msgspec>=0.18",
+  "numpy>=1.26",
+  "pyarrow>=16",
+  "duckdb>=1.0",
+  "prometheus-client>=0.20",
+]
+
+[project.optional-dependencies]
+dashboard = ["streamlit>=1.38", "plotly>=5.22", "pandas>=2.2"]
+dev = ["pytest>=8", "pytest-cov>=5", "hypothesis>=6.100", "ruff>=0.6", "mypy>=1.10", "pandas>=2.2"]
+
+[project.scripts]
+fleetscope = "fleetscope.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fleetscope"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -m 'not kafka'"
+markers = ["kafka: requires a running Kafka broker (FLEETSCOPE_BOOTSTRAP)"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "NPY", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.mypy]
+python_version = "3.11"
+strict_optional = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+files = ["src/fleetscope"]
