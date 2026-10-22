@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: lint · types · tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: pip install -e ".[dev,dashboard]"
+      - run: ruff check src tests infra benchmarks scripts dashboard
+      - run: ruff format --check src tests infra benchmarks scripts dashboard
+      - run: mypy src
+      - run: pytest --cov=fleetscope --cov-report=term-missing:skip-covered
+      - name: Grafana dashboard is up to date with its generator
+        run: python infra/grafana/build_dashboard.py && git diff --exit-code infra/grafana/dashboards
+
+  kafka:
+    name: Kafka integration (exactly-once under crash / rebalance)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: docker compose up -d --wait kafka
+      - run: pytest -m kafka -v
+        env:
+          FLEETSCOPE_BOOTSTRAP: localhost:9092
+      - if: failure()
+        run: docker compose logs kafka | tail -200
+
+  dashboard:
+    name: Dashboard smoke test (headless Chromium)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dashboard]" playwright
+      - run: playwright install --with-deps chromium
+      - run: >
+          fleetscope demo --lake lake --vehicles 30 --minutes 10
+          --comma2k19 data/comma2k19_sample --clones 5 --no-fsync --budget-gb 1
+      - run: |
+          FLEETSCOPE_LAKE=lake streamlit run dashboard/app.py --server.headless true --server.port 8501 &
+          for i in $(seq 60); do curl -sf localhost:8501/_stcore/health && break; sleep 1; done
+          python scripts/dashboard_smoke.py http://localhost:8501 screenshots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dashboard-screenshots
+          path: screenshots/
