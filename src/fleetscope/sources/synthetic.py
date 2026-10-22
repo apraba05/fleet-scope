@@ -48,6 +48,10 @@ DEFAULT_RATES_PER_HOUR: dict[str, float] = {
 WHEELBASE_M = 2.9
 STEERING_RATIO = 15.0
 LONGITUDINAL_EVENTS = {"hard_brake", "harsh_accel", "cut_in"}
+# A vehicle cutting in between ego and an existing lead needs its own length (~4.5 m)
+# plus clearance to that lead; it cannot end up closer to ego than this minimum gap.
+CUT_IN_ROOM_M = 6.5
+CUT_IN_MIN_GAP_M = 2.0
 
 
 @dataclass(frozen=True)
@@ -197,6 +201,17 @@ def _schedule_events(
     return kept
 
 
+def _cut_in_gap(ev: _Event, room: float, length: int, dt: float) -> np.ndarray:
+    """Gap to a vehicle that cut in: starts at ``ttc0 * closing0`` (capped by ``room``)."""
+    closing0 = ev.params["closing0"]
+    gap0 = max(CUT_IN_MIN_GAP_M, min(ev.params["ttc0"] * closing0, room))
+    ttc0 = gap0 / closing0
+    # Closing speed decays as ego brakes; tau = ttc0 / 2 bottoms the gap at gap0 / 2,
+    # so the minimum TTC (= ttc0) occurs at the cut-in itself.
+    closing = closing0 * np.exp(-np.arange(length) * dt / (ttc0 / 2))
+    return gap0 - np.cumsum(closing) * dt
+
+
 def _segment_gradient(x: np.ndarray, breaks: np.ndarray, dt: float) -> np.ndarray:
     """np.gradient within segments separated by ``breaks`` (bool, True = new segment)."""
     out = np.full(len(x), np.nan)
@@ -299,11 +314,20 @@ def generate_trip(
     kappa = np.clip(kappa, -max_lat_curve / v_safe**2, max_lat_curve / v_safe**2)
     yaw = speed * kappa
     # Normal lane changes: a one-period sine in yaw rate over 5 s displaces ~3.5 m.
+    # Drivers do not change lanes in the middle of (or right next to) a sharp turn or an
+    # evasive manoeuvre; superimposed, the two would look like a different manoeuvre.
+    edges = np.zeros(n + 1, dtype=np.int64)
+    for ev in events:
+        if ev.kind in ("sharp_turn", "evasive_swerve"):
+            edges[max(0, ev.start - 3 * hz)] += 1
+            edges[min(n, ev.start + ev.length + 3 * hz)] -= 1
+    busy = np.cumsum(edges)[:n] > 0
     for _ in range(rng.poisson(n / hz / 120)):
         s = int(rng.uniform(0, n - 6 * hz))
         L = 5 * hz
         amp = rng.choice([-1, 1]) * 0.8 / max(speed[s], 5.0)  # peak lateral accel 0.8 m/s^2
-        yaw[s : s + L] += amp * np.sin(np.linspace(0, 2 * np.pi, L))
+        if not busy[s : s + L].any():
+            yaw[s : s + L] += amp * np.sin(np.linspace(0, 2 * np.pi, L))
     for ev in events:
         sl = slice(ev.start, ev.start + ev.length)
         if ev.kind == "sharp_turn":
@@ -332,8 +356,8 @@ def generate_trip(
     drift = _smooth(_ou(rng, n, theta=0.05, sigma=0.12, dt=dt), 5 * hz)
     headway = np.clip(h_driver + drift, 1.0, 4.0)
     standstill = np.full(n, 2.0)
-    forced = np.full(n, np.nan)  # gap override (cut-in profile)
     breaks = np.zeros(n, dtype=bool)
+    cut_ins: dict[int, _Event] = {}
     for ev in events:
         sl = slice(ev.start, ev.start + ev.length)
         if ev.kind == "tailgating":
@@ -350,22 +374,27 @@ def generate_trip(
                 present[a:b] = True
                 ev.start, ev.length = a, b - a  # label covers approach, hold and release
         elif ev.kind == "cut_in" and ev.accepted:
-            closing0 = ev.params["closing0"]
-            gap0 = ev.params["ttc0"] * closing0
-            # Closing speed decays as ego brakes; tau = ttc0 / 2 bottoms the gap at gap0 / 2,
-            # so the minimum TTC (= ttc0) occurs at the cut-in itself.
-            tau_c = ev.params["ttc0"] / 2
-            closing = closing0 * np.exp(-np.arange(ev.length) * dt / tau_c)
-            forced[sl] = gap0 - np.cumsum(closing) * dt
-            present[ev.start : min(n, ev.start + ev.length + 5 * hz)] = True
-            breaks[ev.start] = True  # a different vehicle: new radar track
+            cut_ins[ev.start] = ev
     target = headway * speed + standstill
     gap = np.empty(n)
     g = float(target[0])
     alpha = dt / 2.0
+    forced = np.empty(0)  # gap override while a cut-in vehicle is being followed
+    k = 0
     for i in range(n):
-        f = forced[i]
-        g = f if f == f else g + alpha * (target[i] - g)  # f == f: not NaN
+        cut = cut_ins.get(i)
+        if cut is not None:
+            # The cutting-in vehicle must fit in front of ego: behind an existing lead it
+            # ends up at least CUT_IN_ROOM_M closer, which also caps its initial gap.
+            room = g - CUT_IN_ROOM_M if i > 0 and present[i - 1] else math.inf
+            forced, k = _cut_in_gap(cut, room, cut.length, dt), 0
+            present[i : min(n, i + cut.length + 5 * hz)] = True
+            breaks[i] = True  # a different vehicle: new radar track
+        if k < len(forced):
+            g = float(forced[k])
+            k += 1
+        else:
+            g += alpha * (target[i] - g)
         gap[i] = g
     # Radar measures range and Doppler range-rate independently: derive rel speed from the
     # noise-free gap, then add small, independent measurement noise to each.

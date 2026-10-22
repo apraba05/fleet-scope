@@ -56,3 +56,23 @@ def test_ground_truth_lies_inside_trips_and_dropouts_remove_samples():
         gaps = np.diff(tr.t_ns)
         inside = (tr.t_ns[:-1] < e.start_ns) & (tr.t_ns[1:] > e.end_ns)
         assert inside.any() and gaps[inside].max() > 0.5e9
+
+
+def test_cut_in_vehicle_fits_in_front_of_ego():
+    # A vehicle can only cut in ahead of ego if there is room for it: behind an existing
+    # lead the new gap must be at least a car length (+ clearance) shorter. Regression for
+    # labels whose "cut-in" was physically impossible and looked like a 2.5 m range jump.
+    tracks, gt = generate_fleet(FleetConfig(n_vehicles=200, trip_minutes=20, seed=7))
+    by_trip = {t.trip_id: t for t in tracks}
+    cut_ins = [e for e in gt if e.scenario_type == "cut_in"]
+    assert len(cut_ins) > 30
+    behind_lead = 0
+    for e in cut_ins:
+        tr = by_trip[e.trip_id]
+        i = int(np.searchsorted(tr.t_ns, e.start_ns))
+        before, at = tr.signals["lead_dist"][i - 1], tr.signals["lead_dist"][i]
+        assert at >= 1.5
+        if not np.isnan(before):
+            behind_lead += 1
+            assert before - at >= 6.0, (e, before, at)
+    assert behind_lead > 0  # the constraint was actually exercised

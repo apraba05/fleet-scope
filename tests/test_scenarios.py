@@ -253,3 +253,27 @@ def test_borderline_events_degrade_recall_not_precision(tmp_path):
     assert 0.3 < tp / labels < 0.9  # thresholds sit inside the borderline ranges
     for kind, r in ev.items():
         assert r["tp_detections"] == r["detections"], f"{kind}: false positives"
+
+
+@pytest.mark.parametrize("seed", [1, 7])
+def test_clear_labels_are_unambiguous_at_fleet_scale(seed):
+    # Large clear-intensity fleets (no transport faults): every label is detected as its
+    # own type and nothing else fires. Seeds 1 and 7 at this size previously produced a
+    # sharp turn with a lane change superimposed (read as a swerve) and a cut-in into a
+    # gap too short for a car (read as low TTC).
+    tracks, gt = generate_fleet(FleetConfig(n_vehicles=200, trip_minutes=20, seed=seed))
+    tol = 10**9
+    dets = [s for tr in tracks for s in detect_trip(tr.vehicle_id, tr.trip_id, tr.t_ns, tr.signals)]
+
+    def match(a, b):
+        return (
+            a.trip_id == b.trip_id
+            and a.scenario_type == b.scenario_type
+            and a.start_ns <= b.end_ns + tol
+            and b.start_ns <= a.end_ns + tol
+        )
+
+    missed = [g for g in gt if not any(match(d, g) for d in dets)]
+    spurious = [d.scenario_type for d in dets if not any(match(d, g) for g in gt)]
+    assert len(gt) > 350
+    assert missed == [] and spurious == []
