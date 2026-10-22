@@ -167,18 +167,26 @@ def inject_faults(
         yield e
 
 
-def paced(emissions: Iterable[Emission], speedup: float) -> Iterator[Emission]:
-    """Throttle so event time advances ``speedup`` x faster than wall time (0 = unthrottled)."""
+def paced(
+    emissions: Iterable[Emission], speedup: float, max_gap_s: float = 1.0
+) -> Iterator[Emission]:
+    """Throttle so event time advances ``speedup`` x faster than wall time (0 = unthrottled).
+
+    Event-time gaps longer than ``max_gap_s`` (between sources recorded years apart, or
+    between trips) are compressed to ``max_gap_s`` so the replay never idles on them.
+    """
     if speedup <= 0:
         yield from emissions
         return
     t_wall0 = time.monotonic()
-    t_event0: int | None = None
+    prev: int | None = None
+    elapsed_s = 0.0  # compressed event time since the first emission
+    max_gap_ns = int(max_gap_s * 1e9)
     for e in emissions:
-        if t_event0 is None:
-            t_event0 = e.event_ts_ns
-        due = (e.event_ts_ns - t_event0) / 1e9 / speedup
-        lag = due - (time.monotonic() - t_wall0)
+        if prev is not None:
+            elapsed_s += min(max(e.event_ts_ns - prev, 0), max_gap_ns) / 1e9
+        prev = max(prev or e.event_ts_ns, e.event_ts_ns)
+        lag = elapsed_s / speedup - (time.monotonic() - t_wall0)
         if lag > 0.002:
             time.sleep(lag)
         yield e
