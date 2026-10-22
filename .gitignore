@@ -13,3 +13,4 @@ build/
 /lake/
 /artifacts/
 .DS_Store
+.hypothesis/
