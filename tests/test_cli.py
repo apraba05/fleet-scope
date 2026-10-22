@@ -29,3 +29,8 @@ def test_demo_end_to_end(tmp_path, capsys):
 def test_no_source_is_an_error(tmp_path):
     with pytest.raises(SystemExit):
         main(["local", "--lake", str(tmp_path), "--vehicles", "0"])
+
+
+def test_sql_error_is_reported_without_traceback(tmp_path):
+    with pytest.raises(SystemExit, match="SQL error"):
+        main(["sql", "--lake", str(tmp_path), "SELECT no_such_column FROM telemetry"])

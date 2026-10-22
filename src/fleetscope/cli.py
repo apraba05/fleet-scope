@@ -236,9 +236,15 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 
 
 def cmd_sql(args: argparse.Namespace) -> None:
+    import duckdb
+
     from fleetscope.lake.sql import Lake
 
-    _print_table(Lake(args.lake).arrow(args.query))
+    try:
+        table = Lake(args.lake).arrow(args.query)
+    except duckdb.Error as e:  # user input: report, don't dump a traceback
+        sys.exit(f"SQL error: {e}")
+    _print_table(table)
 
 
 def cmd_demo(args: argparse.Namespace) -> None:
