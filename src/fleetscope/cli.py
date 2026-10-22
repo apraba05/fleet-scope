@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
 from collections.abc import Iterator
@@ -138,7 +139,13 @@ def cmd_replay(args: argparse.Namespace) -> None:
 def _processor_config(args: argparse.Namespace):
     from fleetscope.stream.processor import ProcessorConfig
 
-    return ProcessorConfig(lake_root=args.lake, topic=args.topic, durable=not args.no_fsync)
+    return ProcessorConfig(
+        lake_root=args.lake,
+        topic=args.topic,
+        durable=not args.no_fsync,
+        epoch_max_rows=args.epoch_rows,
+        epoch_max_s=args.epoch_seconds,
+    )
 
 
 def cmd_process(args: argparse.Namespace) -> None:
@@ -255,6 +262,8 @@ def build_parser() -> argparse.ArgumentParser:
     def stream_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("--topic", default="telemetry.raw")
         p.add_argument("--no-fsync", action="store_true", help="skip fsync (benchmarks, CI)")
+        p.add_argument("--epoch-rows", type=int, default=500_000, help="commit after N rows")
+        p.add_argument("--epoch-seconds", type=float, default=10.0, help="... or N seconds")
 
     p = sub.add_parser("replay", help="produce a (synthetic / comma2k19) fleet into Kafka")
     lake_args(p)
@@ -326,6 +335,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    logging.basicConfig(
+        level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(name)s %(message)s"
+    )
     args = build_parser().parse_args(argv)
     args.fn(args)
 

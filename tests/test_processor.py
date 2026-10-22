@@ -136,6 +136,54 @@ def test_crash_between_file_write_and_checkpoint_leaves_no_visible_trace(
         assert a[table].equals(b[table]), table
 
 
+def finish_all(lake, n_partitions):
+    return [PartitionProcessor(cfg(lake), p).finish() for p in range(n_partitions)]
+
+
+def test_drain_epoch_after_committed_input_matches_in_epoch_drain(tmp_path, faulty_topic):
+    # A bounded run whose last epoch was already committed (e.g. Kafka consumer reached the
+    # end after a time-based checkpoint) must still close its windows exactly once.
+    topic, _ = faulty_topic
+    clean, lake = tmp_path / "clean", tmp_path / "lake"
+    run_local(topic, cfg(clean), batch_size=500)
+    run_local(topic, cfg(lake), batch_size=500, drain=False)
+    open_windows = read_table(lake, "windows_10s")
+    assert open_windows.num_rows < read_table(clean, "windows_10s").num_rows
+    files = finish_all(lake, topic.n_partitions)
+    assert all(f and all("-drain.parquet" in str(p) for p, _, _ in f) for f in files)
+    a, b = snapshot(clean), snapshot(lake)
+    for table in SORT:
+        assert a[table].equals(b[table]), table
+    # draining again finds nothing to close and changes nothing
+    assert finish_all(lake, topic.n_partitions) == [[]] * topic.n_partitions
+    assert snapshot(lake)["windows_10s"].equals(b["windows_10s"])
+
+
+def test_crash_during_drain_epoch_is_invisible_and_recovered(tmp_path, faulty_topic, monkeypatch):
+    topic, _ = faulty_topic
+    clean, lake = tmp_path / "clean", tmp_path / "lake"
+    run_local(topic, cfg(clean), batch_size=500)
+    run_local(topic, cfg(lake), batch_size=500, drain=False)
+    before = read_table(lake, "windows_10s")
+
+    def broken_save(root, ckpt, durable=True):
+        raise OSError("disk went away")
+
+    real_save = proc_mod.save_checkpoint
+    monkeypatch.setattr(proc_mod, "save_checkpoint", broken_save)
+    with pytest.raises(OSError):
+        PartitionProcessor(cfg(lake), 0).finish()
+    assert any(lake.rglob("*-drain.parquet"))  # written, but not committed
+    assert read_table(lake, "windows_10s").equals(before)
+
+    monkeypatch.setattr(proc_mod, "save_checkpoint", real_save)
+    recovered = PartitionProcessor(cfg(lake), 0)
+    assert recovered.stats["recovery.orphan_files_removed"] > 0
+    recovered.finish()
+    finish_all(lake, topic.n_partitions)
+    assert snapshot(clean)["windows_10s"].equals(snapshot(lake)["windows_10s"])
+
+
 def test_rerun_without_new_data_is_a_noop(tmp_path, faulty_topic):
     topic, _ = faulty_topic
     run_local(topic, cfg(tmp_path))

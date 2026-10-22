@@ -38,6 +38,8 @@ from fleetscope.schema import (
 )
 from fleetscope.stream.checkpoint import (
     Checkpoint,
+    data_file_name,
+    drain_file_name,
     load_checkpoint,
     remove_uncommitted,
     save_checkpoint,
@@ -121,13 +123,17 @@ class PartitionProcessor:
         ckpt = load_checkpoint(cfg.lake_root, cfg.topic, partition)
         self.next_offset: int | None = None
         self._committed_offset: int | None = None
+        self._drained_at: int | None = None
         if ckpt is not None:
+            self._drained_at = ckpt.drained_at
             self._committed_offset = ckpt.next_offset
             self.next_offset = ckpt.next_offset
             self.dedup = SeqDeduplicator.restore(cfg.dedup_window, ckpt.dedup)
             self.windows.restore(ckpt.windows)
             self.epochs = ckpt.epochs
-        removed = remove_uncommitted(cfg.lake_root, cfg.topic, partition, self.next_offset or 0)
+        removed = remove_uncommitted(
+            cfg.lake_root, cfg.topic, partition, self.next_offset or 0, self._drained_at
+        )
         self.stats["recovery.orphan_files_removed"] += len(removed)
         self.sink = PartitionSink(cfg.lake_root, cfg.topic, partition, durable=cfg.durable)
         self._epoch_start: int | None = self.next_offset
@@ -360,10 +366,29 @@ class PartitionProcessor:
         """Close all open windows into the current epoch (bounded inputs only)."""
         self._emit_windows(self.windows.drain())
 
+    def finish(self) -> list[tuple[Path, int, int]]:
+        """End of a bounded input: close every open window and commit.
+
+        If records are pending, the windows join that epoch. Otherwise (the last epoch is
+        already committed) they are committed as a drain epoch at ``next_offset``.
+        """
+        if self.has_uncommitted:
+            self.drain_windows()
+            return self.checkpoint()
+        closed = self.windows.drain()
+        if not closed:
+            return []
+        assert self.next_offset is not None  # open windows imply consumed records
+        self._emit_windows(closed)
+        return self._commit(drain=True)
+
     def checkpoint(self) -> list[tuple[Path, int, int]]:
         """Commit the current epoch. No-op if nothing was consumed since the last commit."""
         if not self.has_uncommitted:
             return []
+        return self._commit(drain=False)
+
+    def _commit(self, drain: bool) -> list[tuple[Path, int, int]]:
         assert self._epoch_start is not None and self.next_offset is not None
         t0 = time.perf_counter()
         # Compare-and-swap guard: refuse to commit over a checkpoint we did not write.
@@ -377,7 +402,14 @@ class PartitionProcessor:
             )
         first_ms = self._epoch_first_ts_ms or 0
         ingest_date = time.strftime("%Y-%m-%d", time.gmtime(first_ms / 1000))
-        files = self.sink.flush(self._epoch_start, self.next_offset - 1, ingest_date)
+        drained_at = self.next_offset if drain else self._drained_at
+        if drain:
+            name = drain_file_name(self.cfg.topic, self.partition, self.next_offset)
+        else:
+            name = data_file_name(
+                self.cfg.topic, self.partition, self._epoch_start, self.next_offset - 1
+            )
+        files = self.sink.flush(name, ingest_date)
         self.epochs += 1
         save_checkpoint(
             self.cfg.lake_root,
@@ -388,10 +420,12 @@ class PartitionProcessor:
                 dedup=self.dedup.snapshot(),
                 windows=self.windows.snapshot(),
                 epochs=self.epochs,
+                drained_at=drained_at,
             ),
             durable=self.cfg.durable,
         )
         self._committed_offset = self.next_offset
+        self._drained_at = drained_at
         for path, _rows, nbytes in files:
             table = path.relative_to(self.cfg.lake_root).parts[0]
             self.stats[f"files.{table}"] += 1

@@ -12,6 +12,12 @@ Commit protocol for one epoch [epoch_start, next_offset):
 2. atomically replace the checkpoint (tmp + fsync + rename)   <- commit point
 
 A data file is *committed* iff its end offset < the partition's ``next_offset``.
+
+End of a bounded input is a *drain epoch*: it consumes no records but closes every open
+window. Its files are named ``<topic>-p<partition>-<next_offset>-drain.parquet`` and the
+checkpoint records ``drained_at = next_offset``; a drain file is committed iff its offset
+<= ``drained_at``. Draining twice at one offset is impossible (the second finds no open
+windows), so the name is unique.
 Readers only see committed files (see ``fleetscope.lake.catalog``), and on restart the
 processor deletes uncommitted files (start offset >= next_offset) before re-consuming
 from ``next_offset``. A crash at any point therefore yields neither loss nor duplicates.
@@ -38,6 +44,9 @@ FILE_RE = re.compile(
 )
 
 
+DRAIN_RE = re.compile(r"^(?P<topic>.+)-p(?P<partition>\d{3,})-(?P<at>\d{12})-drain\.parquet$")
+
+
 class Checkpoint(msgspec.Struct, kw_only=True):
     version: int = CHECKPOINT_VERSION
     topic: str
@@ -46,6 +55,7 @@ class Checkpoint(msgspec.Struct, kw_only=True):
     dedup: list[StreamDedupState]
     windows: WindowSnapshot
     epochs: int = 0
+    drained_at: int | None = None  # next_offset of the last committed drain epoch
     created_at_ns: int = 0
 
 
@@ -63,6 +73,10 @@ def checkpoint_path(lake_root: str | Path, topic: str, partition: int) -> Path:
 
 def data_file_name(topic: str, partition: int, start: int, end: int) -> str:
     return f"{topic}-p{partition:03d}-{start:012d}-{end:012d}.parquet"
+
+
+def drain_file_name(topic: str, partition: int, at: int) -> str:
+    return f"{topic}-p{partition:03d}-{at:012d}-drain.parquet"
 
 
 def atomic_write(path: Path, data: bytes, durable: bool = True) -> None:
@@ -97,33 +111,37 @@ def save_checkpoint(lake_root: str | Path, ckpt: Checkpoint, durable: bool = Tru
     atomic_write(checkpoint_path(lake_root, ckpt.topic, ckpt.partition), _enc.encode(ckpt), durable)
 
 
-def committed_offsets(lake_root: str | Path) -> dict[tuple[str, int], int]:
-    """(topic, partition) -> next_offset for every checkpoint in the lake."""
-    out: dict[tuple[str, int], int] = {}
+def committed_positions(lake_root: str | Path) -> dict[tuple[str, int], tuple[int, int | None]]:
+    """(topic, partition) -> (next_offset, drained_at) for every checkpoint in the lake."""
+    out: dict[tuple[str, int], tuple[int, int | None]] = {}
     root = checkpoint_dir(lake_root)
     if not root.exists():
         return out
     for p in root.glob("*/p*.ckpt"):
         ckpt = _dec.decode(p.read_bytes())
-        out[(ckpt.topic, ckpt.partition)] = ckpt.next_offset
+        out[(ckpt.topic, ckpt.partition)] = (ckpt.next_offset, ckpt.drained_at)
     return out
 
 
 def remove_uncommitted(
-    lake_root: str | Path, topic: str, partition: int, next_offset: int
+    lake_root: str | Path,
+    topic: str,
+    partition: int,
+    next_offset: int,
+    drained_at: int | None = None,
 ) -> list[Path]:
     """Delete data files of this partition left behind by an epoch that never committed."""
     removed = []
     for f in Path(lake_root).glob("*/**/*.parquet"):
         if f.relative_to(lake_root).parts[0].startswith("_"):
             continue
-        m = FILE_RE.match(f.name)
-        if (
-            m
-            and m["topic"] == topic
-            and int(m["partition"]) == partition
-            and int(m["start"]) >= next_offset
-        ):
+        if m := FILE_RE.match(f.name):
+            stale = int(m["start"]) >= next_offset
+        elif m := DRAIN_RE.match(f.name):
+            stale = drained_at is None or int(m["at"]) > drained_at
+        else:
+            continue
+        if m["topic"] == topic and int(m["partition"]) == partition and stale:
             f.unlink()
             removed.append(f)
     for f in Path(lake_root).glob(f"*/**/.{topic}-p{partition:03d}-*.tmp-*"):

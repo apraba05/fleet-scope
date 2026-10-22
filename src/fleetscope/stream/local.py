@@ -73,8 +73,9 @@ def run_local(
                 raise SimulatedCrash(f"partition {p} after {i + 1} batches")
             if i < len(batches) - 1 and proc.should_checkpoint():
                 proc.checkpoint()
-        if drain and proc.has_uncommitted:
-            proc.drain_windows()
-        proc.checkpoint()
+        if drain:
+            proc.finish()
+        else:
+            proc.checkpoint()
         total.update(proc.stats)
     return total

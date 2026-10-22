@@ -22,7 +22,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from fleetscope.schema import DLQ_SCHEMA, QUARANTINE_SCHEMA, TELEMETRY_SCHEMA, WINDOW_SCHEMA
-from fleetscope.stream.checkpoint import atomic_write, data_file_name
+from fleetscope.stream.checkpoint import atomic_write
 
 PARTITION_TS_COLUMN = {"telemetry": "ts", "quarantine": "ts", "windows_10s": "window_start"}
 TABLE_SCHEMAS = {
@@ -47,15 +47,12 @@ class PartitionSink:
             self._buffers[table].append(data)
             self.buffered_rows += data.num_rows
 
-    def flush(
-        self, start_offset: int, end_offset: int, ingest_date: str
-    ) -> list[tuple[Path, int, int]]:
-        """Write buffered tables as files covering offsets [start, end].
+    def flush(self, name: str, ingest_date: str) -> list[tuple[Path, int, int]]:
+        """Write buffered tables as files called ``name`` (one per table / hour).
 
         Returns ``(path, rows, bytes)`` per file written.
         """
         written: list[tuple[Path, int, int]] = []
-        name = data_file_name(self.topic, self.partition, start_offset, end_offset)
         for table, parts in self._buffers.items():
             # The hot path builds dictionary-encoded string columns (cheap); materialise the
             # declared storage schema once per epoch.
