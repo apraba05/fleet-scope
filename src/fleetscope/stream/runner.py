@@ -143,7 +143,7 @@ class KafkaRunner:
         health = HealthReporter(
             self.pcfg.lake_root,
             cfg.health_interval_s,
-            f"processor-{socket.gethostname()}-{os.getpid()}",
+            f"processor-{socket.gethostname().split('.')[0]}-{os.getpid()}",
         )
         eof: set[int] = set()
         last_msg = time.monotonic()
