@@ -18,7 +18,12 @@ def panel(title, exprs, unit="short", kind="timeseries", w=8, h=7, desc=""):
             "datasource": DS,
             "gridPos": {"x": (n * w) % 24, "y": (n * w) // 24 * h, "w": w, "h": h},
             "fieldConfig": {"defaults": {"unit": unit}, "overrides": []},
-            "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+            "options": (
+                # neutral totals: fixed colour, no sparkline (not an alert state)
+                {"colorMode": "none", "graphMode": "none", "textMode": "value_and_name"}
+                if kind == "stat"
+                else {"legend": {"displayMode": "list", "placement": "bottom"}}
+            ),
             "targets": [
                 {"refId": chr(65 + i), "datasource": DS, "expr": e, "legendFormat": lf}
                 for i, (e, lf) in enumerate(exprs)
